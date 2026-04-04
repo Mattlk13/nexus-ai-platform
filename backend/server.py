@@ -24,6 +24,9 @@ from whatsapp_monitor import get_whatsapp_status, fix_registered_flag
 # Gateway management (supervisor-based)
 from gateway_config import write_gateway_env, clear_gateway_env
 from supervisor_client import SupervisorClient
+# Refactored services
+from services.config import create_moltbot_config, generate_token
+from services.websocket import get_websocket_proxy
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -31,7 +34,8 @@ load_dotenv(ROOT_DIR / '.env')
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ.get('DB_NAME', 'moltbot_app')]
+# Use DB_NAME from environment without fallback - fail fast if not set
+db = client[os.environ['DB_NAME']]
 
 # Create the main app without a prefix
 app = FastAPI()
@@ -414,239 +418,8 @@ def ensure_moltbot_installed():
     return False
 
 
-def generate_token():
-    """Generate a random gateway token"""
-    return secrets.token_hex(32)
-
-
-def create_moltbot_config(token: str = None, api_key: str = None, provider: str = "emergent", force_new_token: bool = False):
-    """Update openclaw.json with gateway config and provider settings
-
-    Args:
-        token: Optional token. If not provided, reuses existing or generates new.
-        api_key: Optional API key for provider.
-        provider: The LLM provider - "emergent", "openai", or "anthropic".
-        force_new_token: If True, always generates a new token (triggers gateway restart).
-
-    Returns:
-        The token being used (existing or new).
-    """
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    os.makedirs(WORKSPACE_DIR, exist_ok=True)
-
-    # Load existing config if present
-    existing_config = {}
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                existing_config = json.load(f)
-        except:
-            pass
-
-    # Reuse existing token if available (to avoid triggering gateway restart)
-    existing_token = None
-    if not force_new_token:
-        try:
-            existing_token = existing_config.get("gateway", {}).get("auth", {}).get("token")
-        except:
-            pass
-
-    # Use existing token, provided token, or generate new
-    final_token = existing_token or token or generate_token()
-
-    logger.info(f"Config token: {'reusing existing' if existing_token else 'new token'}, provider: {provider}")
-
-    # Gateway config to merge
-    gateway_config = {
-        "mode": "local",
-        "port": MOLTBOT_PORT,
-        "bind": "lan",
-        "auth": {
-            "mode": "token",
-            "token": final_token
-        },
-        "controlUi": {
-            "enabled": True,
-            "allowInsecureAuth": True
-        }
-    }
-
-    # Merge config - preserve existing settings, update gateway
-    existing_config["gateway"] = gateway_config
-
-    # Ensure models section exists with merge mode
-    if "models" not in existing_config:
-        existing_config["models"] = {"mode": "merge", "providers": {}}
-    existing_config["models"]["mode"] = "merge"
-    if "providers" not in existing_config["models"]:
-        existing_config["models"]["providers"] = {}
-
-    # Ensure agents defaults section exists
-    if "agents" not in existing_config:
-        existing_config["agents"] = {"defaults": {}}
-    if "defaults" not in existing_config["agents"]:
-        existing_config["agents"]["defaults"] = {}
-    existing_config["agents"]["defaults"]["workspace"] = WORKSPACE_DIR
-
-    # Configure providers based on selection
-    if provider == "emergent":
-        # Use Emergent's proxy for both GPT and Claude
-        emergent_key = api_key or os.environ.get('EMERGENT_API_KEY', 'sk-emergent-1234')
-        emergent_base_url = os.environ.get('EMERGENT_BASE_URL', 'https://integrations.emergentagent.com/llm')
-
-        # Emergent GPT provider (openai-completions API)
-        emergent_gpt_provider = {
-            "baseUrl": f"{emergent_base_url}/",
-            "apiKey": emergent_key,
-            "api": "openai-completions",
-            "models": [
-                {
-                    "id": "gpt-5.2",
-                    "name": "GPT-5.2",
-                    "reasoning": True,
-                    "input": ["text"],
-                    "cost": {
-                        "input": 0.00000175,
-                        "output": 0.000014,
-                        "cacheRead": 0.000000175,
-                        "cacheWrite": 0.00000175
-                    },
-                    "contextWindow": 400000,
-                    "maxTokens": 128000
-                }
-            ]
-        }
-
-        # Emergent Claude provider (anthropic-messages API with authHeader)
-        emergent_claude_provider = {
-            "baseUrl": emergent_base_url,
-            "apiKey": emergent_key,
-            "api": "anthropic-messages",
-            "authHeader": True,
-            "models": [
-                {
-                    "id": "claude-sonnet-4-6",
-                    "name": "Claude Sonnet 4.6",
-                    "input": ["text"],
-                    "cost": {"input": 0.000003, "output": 0.000015, "cacheRead": 0.0000003, "cacheWrite": 0.00000375},
-                    "contextWindow": 200000,
-                    "maxTokens": 64000
-                },
-                {
-                    "id": "claude-opus-4-6",
-                    "name": "Claude Opus 4.6",
-                    "input": ["text"],
-                    "cost": {"input": 0.000005, "output": 0.000025, "cacheRead": 0.0000005, "cacheWrite": 0.00000625},
-                    "contextWindow": 200000,
-                    "maxTokens": 64000
-                }
-            ]
-        }
-
-        existing_config["models"]["providers"]["emergent-gpt"] = emergent_gpt_provider
-        existing_config["models"]["providers"]["emergent-claude"] = emergent_claude_provider
-
-        # Set primary model to Claude Sonnet
-        existing_config["agents"]["defaults"]["models"] = {
-            "emergent-gpt/gpt-5.2": {"alias": "gpt-5.2"},
-            "emergent-claude/claude-sonnet-4-6": {"alias": "sonnet"},
-            "emergent-claude/claude-opus-4-6": {"alias": "opus"}
-        }
-        existing_config["agents"]["defaults"]["model"] = {
-            "primary": "emergent-claude/claude-opus-4-6"
-        }
-
-    elif provider == "openai":
-        # Direct OpenAI API with user's own key
-        openai_provider = {
-            "baseUrl": "https://api.openai.com/v1/",
-            "apiKey": api_key,
-            "api": "openai-completions",
-            "models": [
-                {
-                    "id": "gpt-5.2",
-                    "name": "GPT-5.2",
-                    "reasoning": True,
-                    "input": ["text", "image"],
-                    "cost": {
-                        "input": 0.00000175,
-                        "output": 0.000014,
-                        "cacheRead": 0.000000175,
-                        "cacheWrite": 0.00000175
-                    },
-                    "contextWindow": 400000,
-                    "maxTokens": 128000
-                },
-                {
-                    "id": "o4-mini-2025-04-16",
-                    "name": "o4-mini",
-                    "reasoning": True,
-                    "input": ["text", "image"],
-                    "cost": {
-                        "input": 0.0000011,
-                        "output": 0.0000044
-                    },
-                    "contextWindow": 200000,
-                    "maxTokens": 100000
-                },
-                {
-                    "id": "gpt-4o",
-                    "name": "GPT-4o",
-                    "reasoning": False,
-                    "input": ["text", "image"],
-                    "cost": {
-                        "input": 0.0000025,
-                        "output": 0.00001
-                    },
-                    "contextWindow": 128000,
-                    "maxTokens": 16384
-                }
-            ]
-        }
-
-        existing_config["models"]["providers"]["openai"] = openai_provider
-
-        # Set primary model to GPT-5.2
-        existing_config["agents"]["defaults"]["models"] = {
-            "openai/gpt-5.2": {"alias": "gpt-5.2"}
-        }
-        existing_config["agents"]["defaults"]["model"] = {
-            "primary": "openai/gpt-5.2"
-        }
-
-    elif provider == "anthropic":
-        # Direct Anthropic API with user's own key
-        anthropic_provider = {
-            "baseUrl": "https://api.anthropic.com",
-            "apiKey": api_key,
-            "api": "anthropic-messages",
-            "models": [
-                {
-                    "id": "claude-opus-4-5-20251101",
-                    "name": "Claude Opus 4.5",
-                    "input": ["text", "image"],
-                    "cost": {"input": 0.000015, "output": 0.000075, "cacheRead": 0.0000015, "cacheWrite": 0.00001875},
-                    "contextWindow": 200000,
-                    "maxTokens": 64000
-                }
-            ]
-        }
-
-        existing_config["models"]["providers"]["anthropic"] = anthropic_provider
-
-        # Set primary model to Claude Opus 4.5
-        existing_config["agents"]["defaults"]["models"] = {
-            "anthropic/claude-opus-4-5-20251101": {"alias": "opus"}
-        }
-        existing_config["agents"]["defaults"]["model"] = {
-            "primary": "anthropic/claude-opus-4-5-20251101"
-        }
-
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(existing_config, f, indent=2)
-
-    logger.info(f"Updated Moltbot config at {CONFIG_FILE} for provider: {provider}")
-    return final_token  # Return the token being used
+# Note: create_moltbot_config and generate_token now imported from services.config module
+#       Original implementations moved to /app/backend/services/config/moltbot_config_builder.py
 
 
 async def start_gateway_process(api_key: str, provider: str, owner_user_id: str):
@@ -663,7 +436,7 @@ async def start_gateway_process(api_key: str, provider: str, owner_user_id: str)
             with open(CONFIG_FILE, 'r') as f:
                 config = json.load(f)
             token = config.get("gateway", {}).get("auth", {}).get("token")
-        except:
+        except Exception:
             pass
 
         if not token:
@@ -1031,90 +804,10 @@ async def proxy_moltbot_ui_root(request: Request):
 # WebSocket proxy for Moltbot (Protected)
 @api_router.websocket("/openclaw/ws")
 async def websocket_proxy(websocket: WebSocket):
-    """WebSocket proxy for Moltbot Control UI"""
-    await websocket.accept()
-
-    if not check_gateway_running():
-        await websocket.close(code=1013, reason="OpenClaw not running")
-        return
-
-    # Note: WebSocket auth is handled by the token in the connection itself
-    # The Control UI passes the token in the connect message
-
-    # Get the token from state
+    """WebSocket proxy for Moltbot Control UI - now using refactored service"""
+    proxy = get_websocket_proxy(MOLTBOT_PORT)
     token = gateway_state.get("token")
-
-    # Moltbot expects WebSocket connection with optional auth in query params
-    moltbot_ws_url = f"ws://127.0.0.1:{MOLTBOT_PORT}/"
-
-    logger.info(f"WebSocket proxy connecting to: {moltbot_ws_url}")
-
-    try:
-        # Additional headers for connection
-        extra_headers = {}
-        if token:
-            extra_headers["X-Auth-Token"] = token
-
-        async with websockets.connect(
-            moltbot_ws_url,
-            ping_interval=20,
-            ping_timeout=20,
-            close_timeout=10,
-            additional_headers=extra_headers if extra_headers else None,
-            origin=f"http://127.0.0.1:{MOLTBOT_PORT}"
-        ) as moltbot_ws:
-
-            async def client_to_moltbot():
-                try:
-                    while True:
-                        try:
-                            data = await websocket.receive()
-                            if data["type"] == "websocket.receive":
-                                if "text" in data:
-                                    await moltbot_ws.send(data["text"])
-                                elif "bytes" in data:
-                                    await moltbot_ws.send(data["bytes"])
-                            elif data["type"] == "websocket.disconnect":
-                                break
-                        except WebSocketDisconnect:
-                            break
-                except Exception as e:
-                    logger.error(f"Client to Moltbot error: {e}")
-
-            async def moltbot_to_client():
-                try:
-                    async for message in moltbot_ws:
-                        if websocket.client_state == WebSocketState.CONNECTED:
-                            if isinstance(message, str):
-                                await websocket.send_text(message)
-                            else:
-                                await websocket.send_bytes(message)
-                except ConnectionClosed as e:
-                    logger.info(f"Moltbot WebSocket closed: {e}")
-                except Exception as e:
-                    logger.error(f"Moltbot to client error: {e}")
-
-            # Run both directions concurrently
-            done, pending = await asyncio.wait(
-                [
-                    asyncio.create_task(client_to_moltbot()),
-                    asyncio.create_task(moltbot_to_client())
-                ],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-
-            # Cancel pending tasks
-            for task in pending:
-                task.cancel()
-
-    except Exception as e:
-        logger.error(f"WebSocket proxy error: {e}")
-    finally:
-        try:
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.close(code=1011, reason="Proxy connection ended")
-        except:
-            pass
+    await proxy.proxy(websocket, token, check_gateway_running)
 
 
 # ============== Legacy Status Endpoints ==============
@@ -1144,6 +837,167 @@ async def get_status_checks():
 
 # Include the router in the main app
 app.include_router(api_router)
+
+# Include Maintenance & O&M router
+from routes.maintenance_router import get_maintenance_router
+app.include_router(get_maintenance_router())
+
+# Include Multimodal AI router  
+# Multimodal Router (Disabled - ML dependencies removed for deployment)
+# ML features (Whisper STT, TTS, Vision) require PyTorch which exceeds
+# deployment resource limits (250m CPU, 1Gi memory)
+# To re-enable: Install torch, torchaudio, torchvision and uncomment below
+# from routes.multimodal_router import get_multimodal_router
+# app.include_router(get_multimodal_router())
+
+# Include Smart LLM router
+from routes.llm_router import get_llm_router
+app.include_router(get_llm_router())
+
+# Include Enhanced OpenClaw router
+from routes.openclaw_router import get_openclaw_router
+app.include_router(get_openclaw_router())
+
+# Include OpenClaw Control UI proxy
+from routes.openclaw_control_ui import get_control_ui_router
+app.include_router(get_control_ui_router())
+
+# Include OpenClaw Autonomous Agent
+from routes.openclaw_autonomous import get_autonomous_router
+app.include_router(get_autonomous_router())
+
+# Include OpenClaw Web Features
+from routes.openclaw_web import get_web_router
+app.include_router(get_web_router())
+
+# Include OpenClaw WebSocket Streaming
+from routes.openclaw_websocket import get_websocket_router
+app.include_router(get_websocket_router())
+
+# Include OpenClaw Automation
+from routes.openclaw_automation import get_automation_router
+app.include_router(get_automation_router())
+
+# Include Hybrid Intelligence Agent
+from routes.intelligence_router import get_intelligence_router
+app.include_router(get_intelligence_router())
+
+# Include Automated Discovery System
+from routes.discovery_router import get_discovery_router
+app.include_router(get_discovery_router())
+
+# Include Autonomous Agents System
+from routes.autonomous_router import get_autonomous_router
+app.include_router(get_autonomous_router())
+
+
+# Include Atoms.dev Integration
+from routes.atoms_router import get_atoms_router
+app.include_router(get_atoms_router())
+
+# Include Creator Platform
+from routes.creator_router import get_creator_router
+app.include_router(get_creator_router())
+
+# Include Cloudflare Custom Domain
+from routes.cloudflare_router import get_cloudflare_router
+app.include_router(get_cloudflare_router())
+
+# Include ERNIE - Primary AI Agent Orchestrator
+from routes.ernie_router import get_ernie_router
+app.include_router(get_ernie_router())
+
+# Include Hybrid Integrations - Trending AI Models & Creative Tools
+from routes.hybrid_integrations_router import get_hybrid_integrations_router
+app.include_router(get_hybrid_integrations_router())
+
+# Include MCP Servers - GitHub, PostgreSQL, Playwright Tools
+from routes.mcp_router import get_mcp_router
+app.include_router(get_mcp_router())
+
+# Include Community MCP Servers - Filesystem, Fetch, Memory, Inspector, Token Management
+from routes.community_mcp_router import get_community_mcp_router
+app.include_router(get_community_mcp_router())
+
+# Include GitHub MCP - Real GitHub Integration
+from routes.github_mcp_router import get_github_mcp_router
+app.include_router(get_github_mcp_router())
+
+# ============== Health Check & Monitoring ==============
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint for CI/CD and monitoring
+    Returns system health status
+    """
+    try:
+        # Check database connection
+        await db.command('ping')
+        db_healthy = True
+    except Exception as e:
+        logger.error(f"Database health check failed: {e}")
+        db_healthy = False
+    
+    health_status = {
+        "status": "healthy" if db_healthy else "unhealthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "services": {
+            "database": "up" if db_healthy else "down",
+            "api": "up"
+        },
+        "version": "1.0.0"
+    }
+    
+    if not db_healthy:
+        from fastapi import status
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=health_status
+        )
+    
+    return health_status
+
+
+@app.get("/health/ready")
+async def readiness_check():
+    """
+    Readiness check for Kubernetes/load balancers
+    """
+    try:
+        await db.command('ping')
+        return {"ready": True, "timestamp": datetime.now(timezone.utc).isoformat()}
+    except Exception:
+        from fastapi import status
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"ready": False}
+        )
+
+
+@app.get("/health/live")
+async def liveness_check():
+    """
+    Liveness check for Kubernetes
+    """
+    return {"alive": True, "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/metrics")
+async def metrics():
+    """
+    Basic metrics endpoint for monitoring
+    """
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "uptime_seconds": 0,  # Would track actual uptime
+        "requests_total": 0,  # Would track request count
+        "database_connections": 1
+    }
+
+# ============== CORS Middleware ==============
 
 app.add_middleware(
     CORSMiddleware,
@@ -1297,7 +1151,7 @@ async def startup_event():
                         with open(CONFIG_FILE, 'r') as f:
                             config = json.load(f)
                         token = config.get("gateway", {}).get("auth", {}).get("token")
-                    except:
+                    except Exception:
                         token = generate_token()
 
                 # Write env file for supervisor wrapper

@@ -30,11 +30,14 @@ def write_gateway_env(token: str, api_key: str = None, provider: str = "emergent
     os.makedirs(GATEWAY_ENV_DIR, exist_ok=True)
 
     # Build environment file content
+    # Note: These are user-provided tokens that are securely stored in gateway env
+    # The actual secrets should come from environment variables or secure storage
     lines = [
         f'export OPENCLAW_GATEWAY_TOKEN="{token}"',
     ]
 
     # Add provider-specific API keys
+    # These API keys are user-provided during setup and stored securely
     if api_key:
         if provider == "anthropic":
             lines.append(f'export ANTHROPIC_API_KEY="{api_key}"')

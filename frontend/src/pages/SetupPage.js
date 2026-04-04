@@ -112,7 +112,8 @@ export default function SetupPage() {
         credentials: 'include'
       });
     } catch (e) {
-      // Ignore errors
+      console.error('Logout error:', e);
+      // Continue with logout even if API call fails
     }
     navigate('/login', { replace: true });
   };

@@ -34,7 +34,8 @@ export default function LoginPage() {
           return;
         }
       } catch (e) {
-        // Not authenticated
+        console.error('Auth check failed:', e);
+        // Not authenticated, continue to login page
       }
       setChecking(false);
     };
